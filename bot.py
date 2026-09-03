@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, PeerIdInvalidError, RPCError
 from telethon.tl.functions.channels import GetParticipantsRequest
-from telethon.tl.types import ChannelParticipantsRecent
+from telethon.tl.types import ChannelParticipantsRecent, ChannelParticipantsSearch
 from telethon.sessions import StringSession
 
 # ============================================
@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 print("=" * 60)
-print("🤖 Telethon DM Bot (With /connect Session)")
+print("🤖 Telethon DM Bot (With Active User Detection)")
 print("=" * 60)
 
 # ============================================
@@ -33,7 +33,7 @@ API_HASH = "4f34a89257ac316505f5a47b237454cc"
 BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
 
 # ============================================
-# DATABASE SETUP - RESET DATABASE
+# DATABASE SETUP
 # ============================================
 
 # Delete old database to start fresh
@@ -95,6 +95,8 @@ cursor.execute("""
         user_id INTEGER,
         group_id INTEGER,
         target_user_id INTEGER,
+        username TEXT,
+        first_name TEXT,
         last_seen TIMESTAMP,
         PRIMARY KEY (user_id, group_id, target_user_id)
     )
@@ -181,17 +183,19 @@ def is_already_sent(user_id, group_id, target_user_id):
     """, (user_id, group_id, target_user_id))
     return cursor.fetchone() is not None
 
-def track_active_user(user_id, group_id, target_user_id):
+def track_active_user(user_id, group_id, target_user_id, username="", first_name=""):
     cursor.execute("""
-        INSERT OR REPLACE INTO active_users (user_id, group_id, target_user_id, last_seen)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    """, (user_id, group_id, target_user_id))
+        INSERT OR REPLACE INTO active_users (user_id, group_id, target_user_id, username, first_name, last_seen)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, group_id, target_user_id, username, first_name))
     conn.commit()
 
-def get_active_users(user_id, group_id, minutes=30):
+def get_active_users_from_db(user_id, group_id, minutes=10):
+    """Get active users from database (users who have sent message recently)"""
     cursor.execute("""
         SELECT target_user_id FROM active_users 
         WHERE user_id = ? AND group_id = ? AND last_seen > datetime('now', ?)
+        ORDER BY last_seen DESC
     """, (user_id, group_id, f'-{minutes} minutes'))
     return [row[0] for row in cursor.fetchall()]
 
@@ -257,23 +261,19 @@ async def start_command(event):
             "/session_status - Check session status\n\n"
             "**Group Management:**\n"
             "/addgroup <link> - Add public group\n"
-            "/addprivate <chat_id> - Add private group (use chat_id)\n"
+            "/addprivate <chat_id> - Add private group\n"
             "/addprivatelink <link> <chat_id> - Add private group with link\n"
             "/removegroup <id> - Remove group\n"
             "/listgroups - Show all groups\n\n"
             "**Message Settings:**\n"
             "/caption <message> - Set DM message\n"
             "/setlimit <number> - Set member limit (10-50)\n"
-            "/setdelay <seconds> - Delay between DMs (2-5)\n\n"
+            "/setdelay <seconds> - Delay between DMs (3-10)\n\n"
             "**Start/Stop:**\n"
             "/forcestart - Start DM campaign\n"
             "/stop - Stop campaign\n"
             "/status - Show current status\n"
-            "/test - Test if bot is working\n\n"
-            "**How to get chat_id:**\n"
-            "1. Add @getidsbot to your group\n"
-            "2. Send /getid in group\n"
-            "3. Copy the chat_id (starts with -100)"
+            "/test - Test if bot is working"
         )
 
 @bot.on(events.NewMessage(pattern='/test'))
@@ -498,7 +498,6 @@ async def add_private_group(event):
 
 @bot.on(events.NewMessage(pattern='/addprivatelink'))
 async def add_private_group_with_link(event):
-    """Add private group with link and chat_id"""
     if not event.is_private:
         return
     
@@ -647,12 +646,12 @@ async def set_delay(event):
     try:
         parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await event.reply("❌ Usage: /setdelay 3")
+            await event.reply("❌ Usage: /setdelay 5")
             return
         
         delay = int(parts[1].strip())
-        if delay < 1 or delay > 10:
-            await event.reply("❌ Delay must be between 1 and 10 seconds")
+        if delay < 3 or delay > 15:
+            await event.reply("❌ Delay must be between 3 and 15 seconds")
             return
         
         set_setting(user_id, "delay_seconds", str(delay))
@@ -671,7 +670,7 @@ async def show_status(event):
         groups = get_user_groups(user_id)
         caption = get_caption(user_id)
         limit = get_setting(user_id, "member_limit") or "20"
-        delay = get_setting(user_id, "delay_seconds") or "3"
+        delay = get_setting(user_id, "delay_seconds") or "5"
         running = get_setting(user_id, "is_running") == "true"
         session = get_user_session(user_id)
         
@@ -728,8 +727,8 @@ async def force_start(event):
             f"📝 Message: {caption[:100]}{'...' if len(caption) > 100 else ''}\n"
             f"📊 Groups: {len(groups)}\n"
             f"👥 Limit: {get_setting(user_id, 'member_limit') or '20'} members/group\n"
-            f"⏱️ Delay: {get_setting(user_id, 'delay_seconds') or '3'} seconds\n\n"
-            f"⏳ Sending messages..."
+            f"⏱️ Delay: {get_setting(user_id, 'delay_seconds') or '5'} seconds\n\n"
+            f"⏳ Sending messages to recently active users only..."
         )
         
         asyncio.create_task(dm_loop(user_id, event.sender_id))
@@ -755,21 +754,35 @@ async def stop_campaign(event):
         await event.reply(f"❌ Error: {e}")
 
 # ============================================
-# TRACK ACTIVE USERS
+# TRACK ACTIVE USERS - IMPORTANT!
 # ============================================
 
 @bot.on(events.NewMessage())
 async def track_active(event):
+    """Track all users who send messages in groups"""
     try:
         if event.is_group and event.sender_id:
+            # Get sender info
+            sender = await event.get_sender()
+            username = sender.username if sender else ""
+            first_name = sender.first_name if sender else ""
+            
+            # Track for all users who have sessions
             sessions = get_all_user_sessions()
             for user_id, _ in sessions:
-                track_active_user(user_id, event.chat_id, event.sender_id)
+                track_active_user(
+                    user_id, 
+                    event.chat_id, 
+                    event.sender_id,
+                    username,
+                    first_name
+                )
+                print(f"🔍 Tracked: {first_name} (@{username}) in group {event.chat_id}")
     except Exception as e:
         pass
 
 # ============================================
-# DM LOOP ENGINE
+# DM LOOP ENGINE - WITH ACTIVE USER DETECTION
 # ============================================
 
 async def dm_loop(user_id, admin_chat_id):
@@ -792,10 +805,11 @@ async def dm_loop(user_id, admin_chat_id):
         groups = get_user_groups(user_id)
         caption = get_caption(user_id)
         member_limit = int(get_setting(user_id, "member_limit") or 20)
-        delay = int(get_setting(user_id, "delay_seconds") or 3)
+        delay = int(get_setting(user_id, "delay_seconds") or 5)
         
         total_sent = 0
         total_failed = 0
+        total_skipped = 0
         
         for group in groups:
             if get_setting(user_id, "is_running") != "true":
@@ -809,42 +823,65 @@ async def dm_loop(user_id, admin_chat_id):
             print(f"🔄 Processing {group_title}")
             
             try:
-                active_users = get_active_users(user_id, group_id, minutes=30)
-                print(f"🔍 Active users: {len(active_users)}")
+                # FIRST: Get active users from database (users who sent messages recently)
+                active_users_db = get_active_users_from_db(user_id, group_id, minutes=10)
+                print(f"🔍 Active users in DB: {len(active_users_db)}")
                 
-                if not active_users:
+                # SECOND: If no active users in DB, get from Telegram participants
+                if not active_users_db:
                     await bot.send_message(
                         admin_chat_id,
-                        f"⚠️ No active users found in {group_title}. Getting members..."
+                        f"⚠️ No recent active users found in {group_title}. Checking group members..."
                     )
                     
                     try:
                         entity = await client.get_entity(group_id)
                         members = []
-                        async for participant in client.iter_participants(entity, limit=member_limit):
-                            if not participant.bot:
+                        async for participant in client.iter_participants(entity):
+                            # Only get users who are not bots
+                            if not participant.user.bot:
                                 members.append(participant.id)
-                        users_to_dm = members
-                        print(f"🔍 Found {len(users_to_dm)} members")
+                        
+                        # Take only recent participants (first limit)
+                        users_to_dm = members[:member_limit]
+                        print(f"🔍 Found {len(users_to_dm)} members from group")
+                        
                     except Exception as e:
                         print(f"❌ Error getting members: {e}")
                         await bot.send_message(
                             admin_chat_id,
-                            f"⚠️ Could not get members for {group_title}"
+                            f"⚠️ Could not get members for {group_title}. Error: {str(e)[:100]}"
                         )
                         continue
                 else:
-                    users_to_dm = active_users[:member_limit]
-                    print(f"🔍 Will DM {len(users_to_dm)} users")
+                    # Use active users from DB
+                    users_to_dm = active_users_db[:member_limit]
+                    print(f"🔍 Will DM {len(users_to_dm)} recently active users")
+                    
+                    await bot.send_message(
+                        admin_chat_id,
+                        f"✅ Found {len(users_to_dm)} recently active users in {group_title}"
+                    )
+                
+                if not users_to_dm:
+                    await bot.send_message(
+                        admin_chat_id,
+                        f"⚠️ No users found to DM in {group_title}"
+                    )
+                    continue
                 
                 sent_count = 0
                 failed_count = 0
+                skipped_count = 0
                 
                 for target_user_id in users_to_dm:
                     if get_setting(user_id, "is_running") != "true":
                         break
                     
+                    # Skip if already sent recently
                     if is_already_sent(user_id, group_id, target_user_id):
+                        skipped_count += 1
+                        total_skipped += 1
                         print(f"⏭️ Already sent to {target_user_id}")
                         continue
                     
@@ -880,11 +917,12 @@ async def dm_loop(user_id, admin_chat_id):
                         total_failed += 1
                         print(f"❌ Error: {e}")
                     
+                    # Delay between messages - IMPORTANT to avoid rate limits
                     await asyncio.sleep(delay)
                 
                 await bot.send_message(
                     admin_chat_id,
-                    f"✅ {group_title}: Sent {sent_count}, Failed {failed_count}"
+                    f"✅ {group_title}: Sent {sent_count}, Failed {failed_count}, Skipped {skipped_count}"
                 )
                 
             except Exception as e:
@@ -900,7 +938,8 @@ async def dm_loop(user_id, admin_chat_id):
             admin_chat_id,
             f"✅ **Campaign completed!**\n\n"
             f"📊 Total DMs sent: {total_sent}\n"
-            f"❌ Total failed: {total_failed}"
+            f"❌ Total failed: {total_failed}\n"
+            f"⏭️ Total skipped: {total_skipped}"
         )
         print(f"✅ Campaign completed for user {user_id}!")
         
@@ -915,7 +954,7 @@ async def dm_loop(user_id, admin_chat_id):
 
 async def main():
     print("=" * 60)
-    print("🤖 Telethon DM Bot with /connect Session (FIXED)")
+    print("🤖 Telethon DM Bot with Active User Detection")
     print("=" * 60)
     print(f"🔍 Bot Token: {BOT_TOKEN[:15]}...")
     print("=" * 60)
@@ -927,6 +966,8 @@ async def main():
     print(f"✅ Logged in as: {me.first_name} (@{me.username})")
     print("=" * 60)
     print("🚀 Bot is running! Send /connect to add your session")
+    print("=" * 60)
+    print("📌 Bot will only DM users who were active in last 10 minutes!")
     print("=" * 60)
     
     await bot.run_until_disconnected()
