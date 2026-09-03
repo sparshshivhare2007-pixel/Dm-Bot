@@ -3,10 +3,11 @@ import sqlite3
 import re
 import logging
 from datetime import datetime, timedelta
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, PeerIdInvalidError, RPCError
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsRecent
+from telethon.sessions import StringSession
 
 # ============================================
 # LOGGING SETUP
@@ -205,12 +206,37 @@ print("✅ Bot client created!")
 user_clients = {}
 
 # ============================================
-# COMMAND HANDLERS - FIXED (without chats filter)
+# CREATE USER CLIENT WITH SESSION STRING
+# ============================================
+
+async def create_user_client(user_id, session_string):
+    """Create a TelegramClient with session string"""
+    try:
+        # Use StringSession to load session string
+        session = StringSession(session_string)
+        client = TelegramClient(
+            session,
+            api_id=API_ID,
+            api_hash=API_HASH
+        )
+        await client.connect()
+        
+        # Check if authorized
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None
+        
+        return client
+    except Exception as e:
+        print(f"Error creating client: {e}")
+        return None
+
+# ============================================
+# COMMAND HANDLERS - FIXED
 # ============================================
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
-    # Only respond to private messages
     if event.is_private:
         user_id = event.sender_id
         session = get_user_session(user_id)
@@ -237,7 +263,14 @@ async def start_command(event):
             "/forcestart - Start DM campaign\n"
             "/stop - Stop campaign\n"
             "/status - Show current status\n"
-            "/test - Test if bot is working"
+            "/test - Test if bot is working\n\n"
+            "**How to get session string:**\n"
+            "```python\n"
+            "from telethon import TelegramClient\n"
+            "client = TelegramClient('session', API_ID, API_HASH)\n"
+            "await client.start()\n"
+            "print(client.session.save())\n"
+            "```"
         )
 
 @bot.on(events.NewMessage(pattern='/test'))
@@ -260,7 +293,7 @@ async def connect_session(event):
                 "**How to get session string:**\n"
                 "```python\n"
                 "from telethon import TelegramClient\n"
-                "client = TelegramClient('session', api_id, api_hash)\n"
+                "client = TelegramClient('session', API_ID, API_HASH)\n"
                 "await client.start()\n"
                 "print(client.session.save())\n"
                 "```\n"
@@ -273,14 +306,20 @@ async def connect_session(event):
         await event.reply("⏳ Testing session... Please wait.")
         
         try:
-            # Test session
+            # Test session using StringSession
+            test_session = StringSession(session_string)
             test_client = TelegramClient(
-                f'test_{user_id}',
+                test_session,
                 api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=session_string
+                api_hash=API_HASH
             )
-            await test_client.start()
+            await test_client.connect()
+            
+            if not await test_client.is_user_authorized():
+                await test_client.disconnect()
+                await event.reply("❌ **Invalid session!** Session is not authorized.")
+                return
+            
             me = await test_client.get_me()
             await test_client.disconnect()
             
@@ -293,12 +332,11 @@ async def connect_session(event):
                     await user_clients[user_id].disconnect()
                 except:
                     pass
-            user_clients[user_id] = TelegramClient(
-                f'user_{user_id}',
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=session_string
-            )
+            
+            # Create and store client
+            client = await create_user_client(user_id, session_string)
+            if client:
+                user_clients[user_id] = client
             
             await event.reply(
                 f"✅ **Session connected!**\n\n"
@@ -372,17 +410,16 @@ async def add_public_group(event):
         
         username = match.group(1)
         
+        # Create client if not exists
         if user_id not in user_clients:
-            user_clients[user_id] = TelegramClient(
-                f'user_{user_id}',
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=session
-            )
+            client = await create_user_client(user_id, session)
+            if not client:
+                await event.reply("❌ Failed to create client. Please reconnect.")
+                return
+            user_clients[user_id] = client
         
         try:
             client = user_clients[user_id]
-            await client.connect()
             
             entity = await client.get_entity(f"@{username}")
             title = getattr(entity, 'title', username)
@@ -422,16 +459,14 @@ async def add_private_group(event):
         chat_id = int(parts[1].strip())
         
         if user_id not in user_clients:
-            user_clients[user_id] = TelegramClient(
-                f'user_{user_id}',
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=session
-            )
+            client = await create_user_client(user_id, session)
+            if not client:
+                await event.reply("❌ Failed to create client. Please reconnect.")
+                return
+            user_clients[user_id] = client
         
         try:
             client = user_clients[user_id]
-            await client.connect()
             
             entity = await client.get_entity(chat_id)
             title = getattr(entity, 'title', "Private Group")
@@ -681,16 +716,14 @@ async def dm_loop(user_id, admin_chat_id):
         return
     
     if user_id not in user_clients:
-        user_clients[user_id] = TelegramClient(
-            f'user_{user_id}',
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=session
-        )
+        client = await create_user_client(user_id, session)
+        if not client:
+            await bot.send_message(admin_chat_id, "❌ Failed to create client. Please reconnect.")
+            return
+        user_clients[user_id] = client
     
     try:
         client = user_clients[user_id]
-        await client.connect()
         
         groups = get_user_groups(user_id)
         caption = get_caption(user_id)
