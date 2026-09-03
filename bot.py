@@ -8,6 +8,7 @@ from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, PeerIdInvalidError, RPCError
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsRecent, ChannelParticipantsSearch
+from telethon.tl.types import UserStatusOnline, UserStatusOffline, UserStatusRecently, UserStatusLastMonth, UserStatusLastWeek
 from telethon.sessions import StringSession
 
 # ============================================
@@ -21,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 print("=" * 60)
-print("🤖 Telethon DM Bot (With Active User Detection)")
+print("🤖 Telethon DM Bot (Target: Last Seen Recently)")
 print("=" * 60)
 
 # ============================================
@@ -36,7 +37,6 @@ BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
 # DATABASE SETUP
 # ============================================
 
-# Delete old database to start fresh
 if os.path.exists("bot_data.db"):
     os.remove("bot_data.db")
     print("🗑️ Old database deleted!")
@@ -85,19 +85,6 @@ cursor.execute("""
         group_id INTEGER,
         target_user_id INTEGER,
         sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, group_id, target_user_id)
-    )
-""")
-
-# Active users tracking
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS active_users (
-        user_id INTEGER,
-        group_id INTEGER,
-        target_user_id INTEGER,
-        username TEXT,
-        first_name TEXT,
-        last_seen TIMESTAMP,
         PRIMARY KEY (user_id, group_id, target_user_id)
     )
 """)
@@ -183,22 +170,6 @@ def is_already_sent(user_id, group_id, target_user_id):
     """, (user_id, group_id, target_user_id))
     return cursor.fetchone() is not None
 
-def track_active_user(user_id, group_id, target_user_id, username="", first_name=""):
-    cursor.execute("""
-        INSERT OR REPLACE INTO active_users (user_id, group_id, target_user_id, username, first_name, last_seen)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (user_id, group_id, target_user_id, username, first_name))
-    conn.commit()
-
-def get_active_users_from_db(user_id, group_id, minutes=10):
-    """Get active users from database (users who have sent message recently)"""
-    cursor.execute("""
-        SELECT target_user_id FROM active_users 
-        WHERE user_id = ? AND group_id = ? AND last_seen > datetime('now', ?)
-        ORDER BY last_seen DESC
-    """, (user_id, group_id, f'-{minutes} minutes'))
-    return [row[0] for row in cursor.fetchall()]
-
 # ============================================
 # INITIALIZE BOT
 # ============================================
@@ -213,7 +184,6 @@ bot = TelegramClient(
 
 print("✅ Bot client created!")
 
-# User clients dictionary
 user_clients = {}
 
 # ============================================
@@ -221,7 +191,6 @@ user_clients = {}
 # ============================================
 
 async def create_user_client(user_id, session_string):
-    """Create a TelegramClient with session string"""
     try:
         session = StringSession(session_string)
         client = TelegramClient(
@@ -239,6 +208,89 @@ async def create_user_client(user_id, session_string):
     except Exception as e:
         print(f"Error creating client: {e}")
         return None
+
+# ============================================
+# CHECK USER STATUS FUNCTION
+# ============================================
+
+async def get_user_status(client, user_id):
+    """Get user's last seen status"""
+    try:
+        user = await client.get_entity(user_id)
+        if hasattr(user, 'status'):
+            status = user.status
+            if isinstance(status, UserStatusOnline):
+                return "🟢 Online", True, "online"
+            elif isinstance(status, UserStatusRecently):
+                return "🟠 Recently", True, "recently"
+            elif isinstance(status, UserStatusLastWeek):
+                return "🟡 Last Week", False, "last_week"
+            elif isinstance(status, UserStatusLastMonth):
+                return "🟤 Last Month", False, "last_month"
+            elif isinstance(status, UserStatusOffline):
+                was_online = status.was_online
+                if was_online:
+                    return "⚪ Offline", False, "offline"
+                return "⚪ Offline", False, "offline"
+        return "⚪ Unknown", False, "unknown"
+    except Exception as e:
+        return "❌ Error", False, "error"
+
+# ============================================
+# GET MEMBERS BY STATUS
+# ============================================
+
+async def get_members_by_status(client, group_id, limit=20, status_filter="recently"):
+    """
+    Get members with specific status:
+    - "recently": Last seen recently
+    - "online": Currently online
+    - "recently_online": Recently OR Online
+    - "all": All members
+    """
+    try:
+        entity = await client.get_entity(group_id)
+        members_data = []
+        count = 0
+        
+        async for participant in client.iter_participants(entity):
+            if count >= limit * 2:  # Get extra to filter
+                break
+            
+            if participant.bot:
+                continue
+                
+            user_id = participant.id
+            status_text, is_active, status_type = await get_user_status(client, user_id)
+            
+            # Apply filter
+            if status_filter == "recently" and status_type != "recently":
+                continue
+            elif status_filter == "online" and status_type != "online":
+                continue
+            elif status_filter == "recently_online" and status_type not in ["recently", "online"]:
+                continue
+            # "all" - include everyone
+            
+            members_data.append({
+                'user_id': user_id,
+                'username': participant.username or "",
+                'first_name': participant.first_name or "",
+                'status_text': status_text,
+                'status_type': status_type,
+                'is_active': is_active
+            })
+            
+            count += 1
+            
+            if len(members_data) >= limit:
+                break
+        
+        return members_data
+        
+    except Exception as e:
+        print(f"❌ Error getting members: {e}")
+        return []
 
 # ============================================
 # COMMAND HANDLERS
@@ -269,11 +321,17 @@ async def start_command(event):
             "/caption <message> - Set DM message\n"
             "/setlimit <number> - Set member limit (10-50)\n"
             "/setdelay <seconds> - Delay between DMs (3-10)\n\n"
+            "**Target Settings:**\n"
+            "/settarget <recently|online|recently_online|all> - Set target users\n\n"
             "**Start/Stop:**\n"
             "/forcestart - Start DM campaign\n"
             "/stop - Stop campaign\n"
             "/status - Show current status\n"
-            "/test - Test if bot is working"
+            "/test - Test if bot is working\n\n"
+            "**How to get chat_id:**\n"
+            "1. Add @getidsbot to your group\n"
+            "2. Send /getid in group\n"
+            "3. Copy the chat_id (starts with -100)"
         )
 
 @bot.on(events.NewMessage(pattern='/test'))
@@ -660,6 +718,37 @@ async def set_delay(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
+@bot.on(events.NewMessage(pattern='/settarget'))
+async def set_target(event):
+    if not event.is_private:
+        return
+    
+    user_id = event.sender_id
+    try:
+        parts = event.raw_text.split(" ", 1)
+        if len(parts) < 2:
+            await event.reply(
+                "❌ Usage: /settarget <recently|online|recently_online|all>\n\n"
+                "• recently - Only 'last seen recently' users\n"
+                "• online - Only currently online users\n"
+                "• recently_online - Both recently & online users\n"
+                "• all - All members"
+            )
+            return
+        
+        target = parts[1].strip().lower()
+        valid_targets = ['recently', 'online', 'recently_online', 'all']
+        
+        if target not in valid_targets:
+            await event.reply(f"❌ Invalid target! Choose from: {', '.join(valid_targets)}")
+            return
+        
+        set_setting(user_id, "target", target)
+        await event.reply(f"✅ Target set to: **{target}**")
+        
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
 @bot.on(events.NewMessage(pattern='/status'))
 async def show_status(event):
     if not event.is_private:
@@ -671,15 +760,23 @@ async def show_status(event):
         caption = get_caption(user_id)
         limit = get_setting(user_id, "member_limit") or "20"
         delay = get_setting(user_id, "delay_seconds") or "5"
+        target = get_setting(user_id, "target") or "recently"
         running = get_setting(user_id, "is_running") == "true"
         session = get_user_session(user_id)
+        
+        target_text = {
+            'recently': '🟠 Last Seen Recently',
+            'online': '🟢 Online',
+            'recently_online': '🟢🟠 Recently + Online',
+            'all': '👥 All Members'
+        }.get(target, '🟠 Recently')
         
         status_text = f"""
 📊 **Bot Status**
 
 🔹 **Session:** {'🟢 Connected' if session else '🔴 Not connected'}
 🔹 **Groups:** {len(groups)}
-🔹 **Message:** {caption[:50] + '...' if caption and len(caption) > 50 else caption or 'Not set'}
+🔹 **Target:** {target_text}
 🔹 **Limit:** {limit} members/group
 🔹 **Delay:** {delay} seconds
 🔹 **Status:** {'🟢 Running' if running else '🔴 Stopped'}
@@ -720,15 +817,18 @@ async def force_start(event):
             await event.reply("❌ No groups added! Use /addgroup or /addprivate")
             return
         
+        target = get_setting(user_id, "target") or "recently"
+        
         set_setting(user_id, "is_running", "true")
         
         await event.reply(
             f"🚀 **Campaign started!**\n\n"
             f"📝 Message: {caption[:100]}{'...' if len(caption) > 100 else ''}\n"
             f"📊 Groups: {len(groups)}\n"
+            f"🎯 Target: **{target}** users\n"
             f"👥 Limit: {get_setting(user_id, 'member_limit') or '20'} members/group\n"
             f"⏱️ Delay: {get_setting(user_id, 'delay_seconds') or '5'} seconds\n\n"
-            f"⏳ Sending messages to recently active users only..."
+            f"⏳ Sending messages to {target} users only..."
         )
         
         asyncio.create_task(dm_loop(user_id, event.sender_id))
@@ -754,35 +854,7 @@ async def stop_campaign(event):
         await event.reply(f"❌ Error: {e}")
 
 # ============================================
-# TRACK ACTIVE USERS - IMPORTANT!
-# ============================================
-
-@bot.on(events.NewMessage())
-async def track_active(event):
-    """Track all users who send messages in groups"""
-    try:
-        if event.is_group and event.sender_id:
-            # Get sender info
-            sender = await event.get_sender()
-            username = sender.username if sender else ""
-            first_name = sender.first_name if sender else ""
-            
-            # Track for all users who have sessions
-            sessions = get_all_user_sessions()
-            for user_id, _ in sessions:
-                track_active_user(
-                    user_id, 
-                    event.chat_id, 
-                    event.sender_id,
-                    username,
-                    first_name
-                )
-                print(f"🔍 Tracked: {first_name} (@{username}) in group {event.chat_id}")
-    except Exception as e:
-        pass
-
-# ============================================
-# DM LOOP ENGINE - WITH ACTIVE USER DETECTION
+# DM LOOP ENGINE - WITH STATUS CHECK
 # ============================================
 
 async def dm_loop(user_id, admin_chat_id):
@@ -806,10 +878,12 @@ async def dm_loop(user_id, admin_chat_id):
         caption = get_caption(user_id)
         member_limit = int(get_setting(user_id, "member_limit") or 20)
         delay = int(get_setting(user_id, "delay_seconds") or 5)
+        target = get_setting(user_id, "target") or "recently"
         
         total_sent = 0
         total_failed = 0
         total_skipped = 0
+        total_not_online = 0
         
         for group in groups:
             if get_setting(user_id, "is_running") != "true":
@@ -823,60 +897,41 @@ async def dm_loop(user_id, admin_chat_id):
             print(f"🔄 Processing {group_title}")
             
             try:
-                # FIRST: Get active users from database (users who sent messages recently)
-                active_users_db = get_active_users_from_db(user_id, group_id, minutes=10)
-                print(f"🔍 Active users in DB: {len(active_users_db)}")
+                # Get members with specific status filter
+                members = await get_members_by_status(
+                    client, 
+                    group_id, 
+                    limit=member_limit * 2,  # Get extra to filter
+                    status_filter=target
+                )
                 
-                # SECOND: If no active users in DB, get from Telegram participants
-                if not active_users_db:
+                if not members:
                     await bot.send_message(
                         admin_chat_id,
-                        f"⚠️ No recent active users found in {group_title}. Checking group members..."
-                    )
-                    
-                    try:
-                        entity = await client.get_entity(group_id)
-                        members = []
-                        async for participant in client.iter_participants(entity):
-                            # Only get users who are not bots
-                            if not participant.user.bot:
-                                members.append(participant.id)
-                        
-                        # Take only recent participants (first limit)
-                        users_to_dm = members[:member_limit]
-                        print(f"🔍 Found {len(users_to_dm)} members from group")
-                        
-                    except Exception as e:
-                        print(f"❌ Error getting members: {e}")
-                        await bot.send_message(
-                            admin_chat_id,
-                            f"⚠️ Could not get members for {group_title}. Error: {str(e)[:100]}"
-                        )
-                        continue
-                else:
-                    # Use active users from DB
-                    users_to_dm = active_users_db[:member_limit]
-                    print(f"🔍 Will DM {len(users_to_dm)} recently active users")
-                    
-                    await bot.send_message(
-                        admin_chat_id,
-                        f"✅ Found {len(users_to_dm)} recently active users in {group_title}"
-                    )
-                
-                if not users_to_dm:
-                    await bot.send_message(
-                        admin_chat_id,
-                        f"⚠️ No users found to DM in {group_title}"
+                        f"⚠️ No {target} users found in {group_title}"
                     )
                     continue
+                
+                # Show found users with their status
+                status_summary = {}
+                for m in members:
+                    status_summary[m['status_type']] = status_summary.get(m['status_type'], 0) + 1
+                
+                summary_text = f"✅ Found {len(members)} {target} users:\n"
+                for status_type, count in status_summary.items():
+                    summary_text += f"  • {status_type}: {count}\n"
+                
+                await bot.send_message(admin_chat_id, summary_text)
                 
                 sent_count = 0
                 failed_count = 0
                 skipped_count = 0
                 
-                for target_user_id in users_to_dm:
+                for member in members:
                     if get_setting(user_id, "is_running") != "true":
                         break
+                    
+                    target_user_id = member['user_id']
                     
                     # Skip if already sent recently
                     if is_already_sent(user_id, group_id, target_user_id):
@@ -886,7 +941,7 @@ async def dm_loop(user_id, admin_chat_id):
                         continue
                     
                     try:
-                        print(f"📤 Sending to {target_user_id}")
+                        print(f"📤 Sending to {target_user_id} ({member['status_text']})")
                         await client.send_message(target_user_id, caption)
                         track_sent(user_id, group_id, target_user_id)
                         sent_count += 1
@@ -917,7 +972,7 @@ async def dm_loop(user_id, admin_chat_id):
                         total_failed += 1
                         print(f"❌ Error: {e}")
                     
-                    # Delay between messages - IMPORTANT to avoid rate limits
+                    # Delay between messages
                     await asyncio.sleep(delay)
                 
                 await bot.send_message(
@@ -954,7 +1009,7 @@ async def dm_loop(user_id, admin_chat_id):
 
 async def main():
     print("=" * 60)
-    print("🤖 Telethon DM Bot with Active User Detection")
+    print("🤖 Telethon DM Bot - Target: Last Seen Recently")
     print("=" * 60)
     print(f"🔍 Bot Token: {BOT_TOKEN[:15]}...")
     print("=" * 60)
@@ -965,9 +1020,14 @@ async def main():
     me = await bot.get_me()
     print(f"✅ Logged in as: {me.first_name} (@{me.username})")
     print("=" * 60)
-    print("🚀 Bot is running! Send /connect to add your session")
+    print("🚀 Bot is running!")
+    print("📌 Commands:")
+    print("  • /settarget recently - Only 'last seen recently' users")
+    print("  • /settarget online - Only online users")
+    print("  • /settarget recently_online - Recently + Online")
+    print("  • /settarget all - All members")
     print("=" * 60)
-    print("📌 Bot will only DM users who were active in last 10 minutes!")
+    print("🎯 Default target: 'recently' (Last Seen Recently)")
     print("=" * 60)
     
     await bot.run_until_disconnected()
