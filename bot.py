@@ -188,20 +188,21 @@ def get_active_users(user_id, group_id, minutes=30):
     return [row[0] for row in cursor.fetchall()]
 
 # ============================================
-# INITIALIZE BOT
+# INITIALIZE BOT - FIXED VERSION
 # ============================================
 
 print("🔍 Initializing Telethon Bot...")
 
+# FIX: Bot ko directly start karein
 bot = TelegramClient(
-    'dm_bot',
+    'dm_bot_session',
     api_id=API_ID,
     api_hash=API_HASH
-).start(bot_token=BOT_TOKEN)
+)
 
-print("✅ Bot started!")
+print("✅ Bot client created!")
 
-# Store user clients
+# User clients dictionary
 user_clients = {}
 
 # ============================================
@@ -244,7 +245,6 @@ async def test_command(event):
 
 @bot.on(events.NewMessage(pattern='/connect', chats=lambda x: x.is_private))
 async def connect_session(event):
-    """Connect user's Telethon session"""
     user_id = event.sender_id
     
     try:
@@ -265,11 +265,10 @@ async def connect_session(event):
         
         session_string = parts[1].strip()
         
-        # Test session by creating client
         await event.reply("⏳ Testing session... Please wait.")
         
         try:
-            # Create temporary client to test
+            # Test session
             test_client = TelegramClient(
                 f'test_{user_id}',
                 api_id=API_ID,
@@ -285,7 +284,10 @@ async def connect_session(event):
             
             # Store client
             if user_id in user_clients:
-                await user_clients[user_id].disconnect()
+                try:
+                    await user_clients[user_id].disconnect()
+                except:
+                    pass
             user_clients[user_id] = TelegramClient(
                 f'user_{user_id}',
                 api_id=API_ID,
@@ -337,7 +339,6 @@ async def session_status(event):
 async def add_public_group(event):
     user_id = event.sender_id
     
-    # Check if session exists
     session = get_user_session(user_id)
     if not session:
         await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
@@ -357,7 +358,6 @@ async def add_public_group(event):
         
         username = match.group(1)
         
-        # Get user client
         if user_id not in user_clients:
             user_clients[user_id] = TelegramClient(
                 f'user_{user_id}',
@@ -370,7 +370,6 @@ async def add_public_group(event):
             client = user_clients[user_id]
             await client.connect()
             
-            # Get group info
             entity = await client.get_entity(f"@{username}")
             title = getattr(entity, 'title', username)
             
@@ -392,7 +391,6 @@ async def add_public_group(event):
 async def add_private_group(event):
     user_id = event.sender_id
     
-    # Check if session exists
     session = get_user_session(user_id)
     if not session:
         await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
@@ -566,25 +564,21 @@ async def show_status(event):
 async def force_start(event):
     user_id = event.sender_id
     
-    # Check session
     session = get_user_session(user_id)
     if not session:
         await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
         return
     
     try:
-        # Check if already running
         if get_setting(user_id, "is_running") == "true":
             await event.reply("⚠️ Campaign already running! Use /stop first.")
             return
         
-        # Check caption
         caption = get_caption(user_id)
         if not caption:
             await event.reply("❌ Please set a caption first using /caption")
             return
         
-        # Check groups
         groups = get_user_groups(user_id)
         if not groups:
             await event.reply("❌ No groups added! Use /addgroup or /addprivate")
@@ -601,7 +595,6 @@ async def force_start(event):
             f"⏳ Sending messages..."
         )
         
-        # Start DM loop
         asyncio.create_task(dm_loop(user_id, event.sender_id))
         
     except Exception as e:
@@ -629,7 +622,6 @@ async def stop_campaign(event):
 async def track_active(event):
     try:
         if event.sender_id:
-            # Track for all users who have sessions
             sessions = get_all_user_sessions()
             for user_id, _ in sessions:
                 track_active_user(user_id, event.chat_id, event.sender_id)
@@ -643,7 +635,6 @@ async def track_active(event):
 async def dm_loop(user_id, admin_chat_id):
     print(f"🚀 DM Loop started for user {user_id}")
     
-    # Get user client
     session = get_user_session(user_id)
     if not session:
         return
@@ -680,7 +671,6 @@ async def dm_loop(user_id, admin_chat_id):
             print(f"🔄 Processing {group_title}")
             
             try:
-                # Get active users
                 active_users = get_active_users(user_id, group_id, minutes=30)
                 print(f"🔍 Active users: {len(active_users)}")
                 
@@ -690,7 +680,6 @@ async def dm_loop(user_id, admin_chat_id):
                         f"⚠️ No active users found in {group_title}. Getting members..."
                     )
                     
-                    # Get members using user client
                     try:
                         entity = await client.get_entity(group_id)
                         members = []
@@ -783,18 +772,27 @@ async def dm_loop(user_id, admin_chat_id):
         await bot.send_message(admin_chat_id, f"❌ Error: {e}")
 
 # ============================================
-# RUN BOT
+# FIXED RUN - This is the important part!
 # ============================================
 
 async def main():
     print("=" * 60)
-    print("🤖 Telethon DM Bot with /connect Session")
+    print("🤖 Telethon DM Bot with /connect Session (FIXED)")
     print("=" * 60)
     print(f"🔍 Bot Token: {BOT_TOKEN[:15]}...")
+    print("=" * 60)
+    
+    # Start the bot
+    await bot.start(bot_token=BOT_TOKEN)
+    print("✅ Bot started!")
+    
+    me = await bot.get_me()
+    print(f"✅ Logged in as: {me.first_name} (@{me.username})")
     print("=" * 60)
     print("🚀 Bot is running! Send /connect to add your session")
     print("=" * 60)
     
+    # Keep running
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
