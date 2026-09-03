@@ -32,24 +32,24 @@ API_HASH = "4f34a89257ac316505f5a47b237454cc"
 BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
 
 # ============================================
-# DATABASE SETUP
+# DATABASE SETUP WITH MIGRATION
 # ============================================
 
 print("🔍 Initializing database...")
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# User sessions table
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS user_sessions (
-        user_id INTEGER PRIMARY KEY,
-        session_string TEXT,
-        phone TEXT,
-        connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+# Check if user_id column exists in groups table
+cursor.execute("PRAGMA table_info(groups)")
+columns = [col[1] for col in cursor.fetchall()]
 
-# Groups table
+# Drop and recreate groups table if user_id missing
+if 'user_id' not in columns:
+    print("🔍 Migrating database - adding user_id column...")
+    cursor.execute("DROP TABLE IF EXISTS groups")
+    conn.commit()
+
+# Create all tables
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +59,16 @@ cursor.execute("""
         group_title TEXT,
         is_private INTEGER DEFAULT 0,
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+
+# User sessions table
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_sessions (
+        user_id INTEGER PRIMARY KEY,
+        session_string TEXT,
+        phone TEXT,
+        connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """)
 
@@ -212,7 +222,6 @@ user_clients = {}
 async def create_user_client(user_id, session_string):
     """Create a TelegramClient with session string"""
     try:
-        # Use StringSession to load session string
         session = StringSession(session_string)
         client = TelegramClient(
             session,
@@ -221,7 +230,6 @@ async def create_user_client(user_id, session_string):
         )
         await client.connect()
         
-        # Check if authorized
         if not await client.is_user_authorized():
             await client.disconnect()
             return None
@@ -232,7 +240,7 @@ async def create_user_client(user_id, session_string):
         return None
 
 # ============================================
-# COMMAND HANDLERS - FIXED
+# COMMAND HANDLERS
 # ============================================
 
 @bot.on(events.NewMessage(pattern='/start'))
@@ -252,7 +260,8 @@ async def start_command(event):
             "/session_status - Check session status\n\n"
             "**Group Management:**\n"
             "/addgroup <link> - Add public group\n"
-            "/addprivate <id> - Add private group\n"
+            "/addprivate <chat_id> - Add private group (use chat_id)\n"
+            "/addprivatelink <link> <chat_id> - Add private group with link\n"
             "/removegroup <id> - Remove group\n"
             "/listgroups - Show all groups\n\n"
             "**Message Settings:**\n"
@@ -264,13 +273,10 @@ async def start_command(event):
             "/stop - Stop campaign\n"
             "/status - Show current status\n"
             "/test - Test if bot is working\n\n"
-            "**How to get session string:**\n"
-            "```python\n"
-            "from telethon import TelegramClient\n"
-            "client = TelegramClient('session', API_ID, API_HASH)\n"
-            "await client.start()\n"
-            "print(client.session.save())\n"
-            "```"
+            "**How to get chat_id:**\n"
+            "1. Add @getidsbot to your group\n"
+            "2. Send /getid in group\n"
+            "3. Copy the chat_id (starts with -100)"
         )
 
 @bot.on(events.NewMessage(pattern='/test'))
@@ -306,7 +312,6 @@ async def connect_session(event):
         await event.reply("⏳ Testing session... Please wait.")
         
         try:
-            # Test session using StringSession
             test_session = StringSession(session_string)
             test_client = TelegramClient(
                 test_session,
@@ -323,17 +328,14 @@ async def connect_session(event):
             me = await test_client.get_me()
             await test_client.disconnect()
             
-            # Save session
             save_user_session(user_id, session_string, me.phone)
             
-            # Store client
             if user_id in user_clients:
                 try:
                     await user_clients[user_id].disconnect()
                 except:
                     pass
             
-            # Create and store client
             client = await create_user_client(user_id, session_string)
             if client:
                 user_clients[user_id] = client
@@ -410,7 +412,6 @@ async def add_public_group(event):
         
         username = match.group(1)
         
-        # Create client if not exists
         if user_id not in user_clients:
             client = await create_user_client(user_id, session)
             if not client:
@@ -453,10 +454,35 @@ async def add_private_group(event):
     try:
         parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await event.reply("❌ Usage: /addprivate -100123456789")
+            await event.reply(
+                "❌ Usage: /addprivate <chat_id>\n\n"
+                "**How to get chat_id:**\n"
+                "1. Add @getidsbot to your group\n"
+                "2. Send /getid in group\n"
+                "3. Copy the chat_id (starts with -100)\n\n"
+                "**Example:** /addprivate -1001698843821"
+            )
             return
         
-        chat_id = int(parts[1].strip())
+        chat_id_str = parts[1].strip()
+        
+        # Handle different formats
+        if chat_id_str.startswith('https://'):
+            await event.reply(
+                "❌ Please use chat_id only, not link.\n\n"
+                "**How to get chat_id:**\n"
+                "1. Add @getidsbot to your group\n"
+                "2. Send /getid in group\n"
+                "3. Copy the chat_id (starts with -100)\n\n"
+                "**Example:** /addprivate -1001698843821"
+            )
+            return
+        
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            await event.reply(f"❌ Invalid chat_id: {chat_id_str}\n\nPlease use numeric chat_id like -1001698843821")
+            return
         
         if user_id not in user_clients:
             client = await create_user_client(user_id, session)
@@ -477,6 +503,59 @@ async def add_private_group(event):
                 f"✅ **Private group added!**\n"
                 f"📌 Title: {title}\n"
                 f"🆔 ID: `{chat_id}`"
+            )
+            
+        except Exception as e:
+            await event.reply(f"❌ Error: {e}\n\nMake sure you're a member of this group.")
+            
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
+@bot.on(events.NewMessage(pattern='/addprivatelink'))
+async def add_private_group_with_link(event):
+    """Add private group with link and chat_id"""
+    if not event.is_private:
+        return
+    
+    user_id = event.sender_id
+    
+    session = get_user_session(user_id)
+    if not session:
+        await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
+        return
+    
+    try:
+        parts = event.raw_text.split(" ", 2)
+        if len(parts) < 3:
+            await event.reply(
+                "❌ Usage: /addprivatelink <group_link> <chat_id>\n\n"
+                "**Example:** /addprivatelink https://t.me/+IP5pMoioYpw1YTll -1001698843821"
+            )
+            return
+        
+        link = parts[1].strip()
+        chat_id = int(parts[2].strip())
+        
+        if user_id not in user_clients:
+            client = await create_user_client(user_id, session)
+            if not client:
+                await event.reply("❌ Failed to create client. Please reconnect.")
+                return
+            user_clients[user_id] = client
+        
+        try:
+            client = user_clients[user_id]
+            
+            entity = await client.get_entity(chat_id)
+            title = getattr(entity, 'title', "Private Group")
+            
+            add_group(user_id, chat_id, link, 1, title)
+            
+            await event.reply(
+                f"✅ **Private group added!**\n"
+                f"📌 Title: {title}\n"
+                f"🆔 ID: `{chat_id}`\n"
+                f"🔗 Link: {link}"
             )
             
         except Exception as e:
@@ -856,7 +935,6 @@ async def main():
     print(f"🔍 Bot Token: {BOT_TOKEN[:15]}...")
     print("=" * 60)
     
-    # Start the bot
     await bot.start(bot_token=BOT_TOKEN)
     print("✅ Bot started!")
     
@@ -866,7 +944,6 @@ async def main():
     print("🚀 Bot is running! Send /connect to add your session")
     print("=" * 60)
     
-    # Keep running
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
