@@ -188,12 +188,11 @@ def get_active_users(user_id, group_id, minutes=30):
     return [row[0] for row in cursor.fetchall()]
 
 # ============================================
-# INITIALIZE BOT - FIXED VERSION
+# INITIALIZE BOT
 # ============================================
 
 print("🔍 Initializing Telethon Bot...")
 
-# FIX: Bot ko directly start karein
 bot = TelegramClient(
     'dm_bot_session',
     api_id=API_ID,
@@ -206,45 +205,51 @@ print("✅ Bot client created!")
 user_clients = {}
 
 # ============================================
-# COMMAND HANDLERS
+# COMMAND HANDLERS - FIXED (without chats filter)
 # ============================================
 
-@bot.on(events.NewMessage(pattern='/start', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
-    user_id = event.sender_id
-    session = get_user_session(user_id)
-    status = "🟢 Connected" if session else "🔴 Not connected"
-    
-    await event.reply(
-        f"🤖 **DM Bot Active!**\n\n"
-        f"🔹 **Session Status:** {status}\n\n"
-        "📌 **Commands:**\n\n"
-        "**Session Management:**\n"
-        "/connect <session_string> - Connect your Telethon session\n"
-        "/disconnect - Disconnect your session\n"
-        "/session_status - Check session status\n\n"
-        "**Group Management:**\n"
-        "/addgroup <link> - Add public group\n"
-        "/addprivate <id> - Add private group\n"
-        "/removegroup <id> - Remove group\n"
-        "/listgroups - Show all groups\n\n"
-        "**Message Settings:**\n"
-        "/caption <message> - Set DM message\n"
-        "/setlimit <number> - Set member limit (10-50)\n"
-        "/setdelay <seconds> - Delay between DMs (2-5)\n\n"
-        "**Start/Stop:**\n"
-        "/forcestart - Start DM campaign\n"
-        "/stop - Stop campaign\n"
-        "/status - Show current status\n"
-        "/test - Test if bot is working"
-    )
+    # Only respond to private messages
+    if event.is_private:
+        user_id = event.sender_id
+        session = get_user_session(user_id)
+        status = "🟢 Connected" if session else "🔴 Not connected"
+        
+        await event.reply(
+            f"🤖 **DM Bot Active!**\n\n"
+            f"🔹 **Session Status:** {status}\n\n"
+            "📌 **Commands:**\n\n"
+            "**Session Management:**\n"
+            "/connect <session_string> - Connect your Telethon session\n"
+            "/disconnect - Disconnect your session\n"
+            "/session_status - Check session status\n\n"
+            "**Group Management:**\n"
+            "/addgroup <link> - Add public group\n"
+            "/addprivate <id> - Add private group\n"
+            "/removegroup <id> - Remove group\n"
+            "/listgroups - Show all groups\n\n"
+            "**Message Settings:**\n"
+            "/caption <message> - Set DM message\n"
+            "/setlimit <number> - Set member limit (10-50)\n"
+            "/setdelay <seconds> - Delay between DMs (2-5)\n\n"
+            "**Start/Stop:**\n"
+            "/forcestart - Start DM campaign\n"
+            "/stop - Stop campaign\n"
+            "/status - Show current status\n"
+            "/test - Test if bot is working"
+        )
 
-@bot.on(events.NewMessage(pattern='/test', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/test'))
 async def test_command(event):
-    await event.reply("✅ **Bot is working!** Test successful! 🎉")
+    if event.is_private:
+        await event.reply("✅ **Bot is working!** Test successful! 🎉")
 
-@bot.on(events.NewMessage(pattern='/connect', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/connect'))
 async def connect_session(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     
     try:
@@ -309,8 +314,11 @@ async def connect_session(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/disconnect', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/disconnect'))
 async def disconnect_session(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     
     if user_id in user_clients:
@@ -325,8 +333,11 @@ async def disconnect_session(event):
     
     await event.reply("✅ **Session disconnected!**")
 
-@bot.on(events.NewMessage(pattern='/session_status', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/session_status'))
 async def session_status(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     session = get_user_session(user_id)
     
@@ -335,8 +346,11 @@ async def session_status(event):
     else:
         await event.reply("❌ **No session connected!**\n\nUse /connect to connect your session.")
 
-@bot.on(events.NewMessage(pattern='/addgroup', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/addgroup'))
 async def add_public_group(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     
     session = get_user_session(user_id)
@@ -387,8 +401,11 @@ async def add_public_group(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/addprivate', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/addprivate'))
 async def add_private_group(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     
     session = get_user_session(user_id)
@@ -433,8 +450,11 @@ async def add_private_group(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/removegroup', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/removegroup'))
 async def remove_group_cmd(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         parts = event.raw_text.split(" ", 1)
@@ -449,8 +469,11 @@ async def remove_group_cmd(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/listgroups', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/listgroups'))
 async def list_groups(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         groups = get_user_groups(user_id)
@@ -469,8 +492,11 @@ async def list_groups(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/caption', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/caption'))
 async def set_caption(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         parts = event.raw_text.split(" ", 1)
@@ -490,8 +516,11 @@ async def set_caption(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/setlimit', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/setlimit'))
 async def set_limit(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         parts = event.raw_text.split(" ", 1)
@@ -510,8 +539,11 @@ async def set_limit(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/setdelay', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/setdelay'))
 async def set_delay(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         parts = event.raw_text.split(" ", 1)
@@ -530,8 +562,11 @@ async def set_delay(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/status', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/status'))
 async def show_status(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         groups = get_user_groups(user_id)
@@ -560,8 +595,11 @@ async def show_status(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/forcestart', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/forcestart'))
 async def force_start(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     
     session = get_user_session(user_id)
@@ -600,8 +638,11 @@ async def force_start(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern='/stop', chats=lambda x: x.is_private))
+@bot.on(events.NewMessage(pattern='/stop'))
 async def stop_campaign(event):
+    if not event.is_private:
+        return
+    
     user_id = event.sender_id
     try:
         if get_setting(user_id, "is_running") != "true":
@@ -618,10 +659,10 @@ async def stop_campaign(event):
 # TRACK ACTIVE USERS
 # ============================================
 
-@bot.on(events.NewMessage(pattern='.*', chats=lambda x: x.is_group))
+@bot.on(events.NewMessage())
 async def track_active(event):
     try:
-        if event.sender_id:
+        if event.is_group and event.sender_id:
             sessions = get_all_user_sessions()
             for user_id, _ in sessions:
                 track_active_user(user_id, event.chat_id, event.sender_id)
@@ -772,7 +813,7 @@ async def dm_loop(user_id, admin_chat_id):
         await bot.send_message(admin_chat_id, f"❌ Error: {e}")
 
 # ============================================
-# FIXED RUN - This is the important part!
+# RUN BOT
 # ============================================
 
 async def main():
