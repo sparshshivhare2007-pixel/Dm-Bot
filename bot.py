@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import re
 import logging
+import os
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, PeerIdInvalidError, RPCError
@@ -32,24 +33,19 @@ API_HASH = "4f34a89257ac316505f5a47b237454cc"
 BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
 
 # ============================================
-# DATABASE SETUP WITH MIGRATION
+# DATABASE SETUP - RESET DATABASE
 # ============================================
 
-print("🔍 Initializing database...")
+# Delete old database to start fresh
+if os.path.exists("bot_data.db"):
+    os.remove("bot_data.db")
+    print("🗑️ Old database deleted!")
+
+print("🔍 Creating fresh database...")
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Check if user_id column exists in groups table
-cursor.execute("PRAGMA table_info(groups)")
-columns = [col[1] for col in cursor.fetchall()]
-
-# Drop and recreate groups table if user_id missing
-if 'user_id' not in columns:
-    print("🔍 Migrating database - adding user_id column...")
-    cursor.execute("DROP TABLE IF EXISTS groups")
-    conn.commit()
-
-# Create all tables
+# Groups table
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +111,7 @@ cursor.execute("""
 """)
 
 conn.commit()
-print("✅ Database initialized!")
+print("✅ Fresh database created!")
 
 # ============================================
 # DATABASE FUNCTIONS
@@ -150,6 +146,7 @@ def add_group(user_id, group_id, group_link, is_private=0, title=""):
         VALUES (?, ?, ?, ?, ?)
     """, (user_id, group_id, group_link, is_private, title))
     conn.commit()
+    print(f"✅ Group added: {title} (ID: {group_id}) for user {user_id}")
 
 def get_user_groups(user_id):
     cursor.execute("SELECT * FROM groups WHERE user_id = ?", (user_id,))
@@ -465,18 +462,6 @@ async def add_private_group(event):
             return
         
         chat_id_str = parts[1].strip()
-        
-        # Handle different formats
-        if chat_id_str.startswith('https://'):
-            await event.reply(
-                "❌ Please use chat_id only, not link.\n\n"
-                "**How to get chat_id:**\n"
-                "1. Add @getidsbot to your group\n"
-                "2. Send /getid in group\n"
-                "3. Copy the chat_id (starts with -100)\n\n"
-                "**Example:** /addprivate -1001698843821"
-            )
-            return
         
         try:
             chat_id = int(chat_id_str)
