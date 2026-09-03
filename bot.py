@@ -1,33 +1,58 @@
 import asyncio
 import sqlite3
 import re
-import os
+import logging
 from datetime import datetime, timedelta
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait, PeerIdInvalid
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError, PeerIdInvalidError, RPCError
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsRecent
 
 # ============================================
-# CONFIGURATION
+# LOGGING SETUP
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+print("=" * 60)
+print("🤖 Telethon DM Bot (With /connect Session)")
+print("=" * 60)
+
+# ============================================
+# CONFIGURATION - BOT TOKEN
 # ============================================
 
 API_ID = 32141443
 API_HASH = "4f34a89257ac316505f5a47b237454cc"
-SESSION_STRING = "BQCZzqEAgaPva-BCCdfZXTFdBuFymHf78kAFzLGh_lxby6K4iIyXXtmItVIv8VxwyBIlZloGgMh-Rn-GKZifaJ4Ir2gEOuIWjjKQcZKQYLugYXhGfB9Pot0N8aFo7BKwla4sEb_Idues1Q7tXiJwP3yvJlo8W1dfTUSJPP3wdSRMNZs2_IdX8lTTM-2-sbdVRCqbzXM9NPkjw5bgQfw2SQvAVR4MzsP2YietQ47cQqPM8Wa_sYDGvUqPFcZSqSlbcd-EVuq4G_ot3HRX3Lh-8fETwyEvd74j9huZxx--jm508F0tnKVZ7V2og6Kcx1E79kijX9kQzrDTh9B74ZWqm3myOMOQPwAAAAF1XmqZAA"
 BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
 
 # ============================================
 # DATABASE SETUP
 # ============================================
 
-print("🔍 [DEBUG] Initializing database...")
+print("🔍 Initializing database...")
 conn = sqlite3.connect("bot_data.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# User sessions table
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_sessions (
+        user_id INTEGER PRIMARY KEY,
+        session_string TEXT,
+        phone TEXT,
+        connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+""")
 
 # Groups table
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
         group_id INTEGER UNIQUE,
         group_link TEXT,
         group_title TEXT,
@@ -39,18 +64,21 @@ cursor.execute("""
 # Settings table
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
+        user_id INTEGER,
+        key TEXT,
+        value TEXT,
+        PRIMARY KEY (user_id, key)
     )
 """)
 
 # Sent tracking
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS sent_tracking (
-        group_id INTEGER,
         user_id INTEGER,
+        group_id INTEGER,
+        target_user_id INTEGER,
         sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (group_id, user_id)
+        PRIMARY KEY (user_id, group_id, target_user_id)
     )
 """)
 
@@ -59,8 +87,9 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS active_users (
         user_id INTEGER,
         group_id INTEGER,
+        target_user_id INTEGER,
         last_seen TIMESTAMP,
-        PRIMARY KEY (user_id, group_id)
+        PRIMARY KEY (user_id, group_id, target_user_id)
     )
 """)
 
@@ -68,381 +97,456 @@ cursor.execute("""
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS captions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
         caption_text TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """)
 
 conn.commit()
-print("✅ [DEBUG] Database initialized successfully!")
-
-# Default settings
-cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('member_limit', '20')")
-cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('delay_seconds', '3')")
-cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('is_running', 'false')")
-conn.commit()
-print("✅ [DEBUG] Default settings set!")
+print("✅ Database initialized!")
 
 # ============================================
 # DATABASE FUNCTIONS
 # ============================================
 
-def get_setting(key):
-    print(f"🔍 [DEBUG] get_setting: {key}")
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+def get_setting(user_id, key):
+    cursor.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key))
     result = cursor.fetchone()
-    print(f"🔍 [DEBUG] get_setting result: {result[0] if result else None}")
     return result[0] if result else None
 
-def set_setting(key, value):
-    print(f"🔍 [DEBUG] set_setting: {key} = {value}")
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+def set_setting(user_id, key, value):
+    cursor.execute("INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, ?, ?)", (user_id, key, value))
     conn.commit()
-    print(f"✅ [DEBUG] Setting saved!")
 
-def add_group(group_id, group_link, is_private=0, title=""):
-    print(f"🔍 [DEBUG] add_group: {group_id}, {group_link}, {is_private}, {title}")
-    cursor.execute("""
-        INSERT OR IGNORE INTO groups (group_id, group_link, is_private, group_title)
-        VALUES (?, ?, ?, ?)
-    """, (group_id, group_link, is_private, title))
+def save_user_session(user_id, session_string, phone=""):
+    cursor.execute("INSERT OR REPLACE INTO user_sessions (user_id, session_string, phone) VALUES (?, ?, ?)", 
+                   (user_id, session_string, phone))
     conn.commit()
-    print(f"✅ [DEBUG] Group added!")
 
-def remove_group(group_id):
-    print(f"🔍 [DEBUG] remove_group: {group_id}")
-    cursor.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
-    conn.commit()
-    print(f"✅ [DEBUG] Group removed!")
-
-def get_all_groups():
-    print(f"🔍 [DEBUG] get_all_groups called")
-    cursor.execute("SELECT * FROM groups")
-    result = cursor.fetchall()
-    print(f"🔍 [DEBUG] Found {len(result)} groups")
-    return result
-
-def get_group_count():
-    cursor.execute("SELECT COUNT(*) FROM groups")
-    result = cursor.fetchone()[0]
-    print(f"🔍 [DEBUG] Group count: {result}")
-    return result
-
-def save_caption(caption):
-    print(f"🔍 [DEBUG] save_caption: {caption[:50]}...")
-    cursor.execute("DELETE FROM captions")
-    cursor.execute("INSERT INTO captions (caption_text) VALUES (?)", (caption,))
-    conn.commit()
-    print(f"✅ [DEBUG] Caption saved!")
-
-def get_caption():
-    print(f"🔍 [DEBUG] get_caption called")
-    cursor.execute("SELECT caption_text FROM captions ORDER BY id DESC LIMIT 1")
+def get_user_session(user_id):
+    cursor.execute("SELECT session_string FROM user_sessions WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
-    print(f"🔍 [DEBUG] Caption found: {result[0] if result else None}")
     return result[0] if result else None
 
-def track_sent(group_id, user_id):
-    print(f"🔍 [DEBUG] track_sent: group={group_id}, user={user_id}")
-    cursor.execute("""
-        INSERT OR REPLACE INTO sent_tracking (group_id, user_id, sent_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-    """, (group_id, user_id))
-    conn.commit()
-    print(f"✅ [DEBUG] Sent tracked!")
+def get_all_user_sessions():
+    cursor.execute("SELECT user_id, session_string FROM user_sessions")
+    return cursor.fetchall()
 
-def is_already_sent(group_id, user_id):
+def add_group(user_id, group_id, group_link, is_private=0, title=""):
+    cursor.execute("""
+        INSERT OR IGNORE INTO groups (user_id, group_id, group_link, is_private, group_title)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, group_id, group_link, is_private, title))
+    conn.commit()
+
+def get_user_groups(user_id):
+    cursor.execute("SELECT * FROM groups WHERE user_id = ?", (user_id,))
+    return cursor.fetchall()
+
+def remove_group(user_id, group_id):
+    cursor.execute("DELETE FROM groups WHERE user_id = ? AND group_id = ?", (user_id, group_id))
+    conn.commit()
+
+def save_caption(user_id, caption):
+    cursor.execute("DELETE FROM captions WHERE user_id = ?", (user_id,))
+    cursor.execute("INSERT INTO captions (user_id, caption_text) VALUES (?, ?)", (user_id, caption))
+    conn.commit()
+
+def get_caption(user_id):
+    cursor.execute("SELECT caption_text FROM captions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+def track_sent(user_id, group_id, target_user_id):
+    cursor.execute("""
+        INSERT OR REPLACE INTO sent_tracking (user_id, group_id, target_user_id, sent_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, group_id, target_user_id))
+    conn.commit()
+
+def is_already_sent(user_id, group_id, target_user_id):
     cursor.execute("""
         SELECT 1 FROM sent_tracking 
-        WHERE group_id = ? AND user_id = ? 
+        WHERE user_id = ? AND group_id = ? AND target_user_id = ?
         AND sent_at > datetime('now', '-1 hour')
-    """, (group_id, user_id))
-    result = cursor.fetchone() is not None
-    print(f"🔍 [DEBUG] is_already_sent: {result}")
-    return result
+    """, (user_id, group_id, target_user_id))
+    return cursor.fetchone() is not None
 
-def track_active_user(user_id, group_id):
-    print(f"🔍 [DEBUG] track_active_user: user={user_id}, group={group_id}")
+def track_active_user(user_id, group_id, target_user_id):
     cursor.execute("""
-        INSERT OR REPLACE INTO active_users (user_id, group_id, last_seen)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-    """, (user_id, group_id))
+        INSERT OR REPLACE INTO active_users (user_id, group_id, target_user_id, last_seen)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, group_id, target_user_id))
     conn.commit()
-    print(f"✅ [DEBUG] Active user tracked!")
 
-def get_active_users(group_id, minutes=30):
-    print(f"🔍 [DEBUG] get_active_users: group={group_id}, minutes={minutes}")
+def get_active_users(user_id, group_id, minutes=30):
     cursor.execute("""
-        SELECT user_id FROM active_users 
-        WHERE group_id = ? AND last_seen > datetime('now', ?)
-    """, (group_id, f'-{minutes} minutes'))
-    result = [row[0] for row in cursor.fetchall()]
-    print(f"🔍 [DEBUG] Found {len(result)} active users")
-    return result
-
-def clear_sent_log():
-    print(f"🔍 [DEBUG] clear_sent_log called")
-    cursor.execute("DELETE FROM sent_tracking WHERE sent_at < datetime('now', '-1 day')")
-    conn.commit()
-    print(f"✅ [DEBUG] Old sent logs cleared!")
+        SELECT target_user_id FROM active_users 
+        WHERE user_id = ? AND group_id = ? AND last_seen > datetime('now', ?)
+    """, (user_id, group_id, f'-{minutes} minutes'))
+    return [row[0] for row in cursor.fetchall()]
 
 # ============================================
 # INITIALIZE BOT
 # ============================================
 
-print("🔍 [DEBUG] Initializing Pyrogram Client...")
-app = Client(
-    "dm_bot",
+print("🔍 Initializing Telethon Bot...")
+
+bot = TelegramClient(
+    'dm_bot',
     api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-print("✅ [DEBUG] Client initialized!")
+    api_hash=API_HASH
+).start(bot_token=BOT_TOKEN)
+
+print("✅ Bot started!")
+
+# Store user clients
+user_clients = {}
 
 # ============================================
 # COMMAND HANDLERS
 # ============================================
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client, message):
-    print(f"🔍 [DEBUG] START command received from {message.from_user.id}")
-    try:
-        await message.reply_text(
-            "🤖 **DM Bot Active!**\n\n"
-            "📌 **Commands:**\n\n"
-            "**Group Management:**\n"
-            "/addgroup <link> - Add public group\n"
-            "/addprivate <id> - Add private group (use chat_id)\n"
-            "/removegroup <id> - Remove group\n"
-            "/listgroups - Show all groups\n\n"
-            "**Message Settings:**\n"
-            "/caption <message> - Set DM message\n"
-            "/setlimit <number> - Set member limit (10-50)\n"
-            "/setdelay <seconds> - Delay between DMs (2-5)\n\n"
-            "**Start/Stop:**\n"
-            "/forcestart - Start DM campaign\n"
-            "/stop - Stop campaign\n"
-            "/status - Show current status\n\n"
-            "**Example Flow:**\n"
-            "1. /addgroup https://t.me/groupname\n"
-            "2. /caption Hello! I'm a freelancer...\n"
-            "3. /setlimit 20\n"
-            "4. /forcestart"
-        )
-        print(f"✅ [DEBUG] Start reply sent to {message.from_user.id}")
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in start_command: {e}")
+@bot.on(events.NewMessage(pattern='/start', chats=lambda x: x.is_private))
+async def start_command(event):
+    user_id = event.sender_id
+    session = get_user_session(user_id)
+    status = "🟢 Connected" if session else "🔴 Not connected"
+    
+    await event.reply(
+        f"🤖 **DM Bot Active!**\n\n"
+        f"🔹 **Session Status:** {status}\n\n"
+        "📌 **Commands:**\n\n"
+        "**Session Management:**\n"
+        "/connect <session_string> - Connect your Telethon session\n"
+        "/disconnect - Disconnect your session\n"
+        "/session_status - Check session status\n\n"
+        "**Group Management:**\n"
+        "/addgroup <link> - Add public group\n"
+        "/addprivate <id> - Add private group\n"
+        "/removegroup <id> - Remove group\n"
+        "/listgroups - Show all groups\n\n"
+        "**Message Settings:**\n"
+        "/caption <message> - Set DM message\n"
+        "/setlimit <number> - Set member limit (10-50)\n"
+        "/setdelay <seconds> - Delay between DMs (2-5)\n\n"
+        "**Start/Stop:**\n"
+        "/forcestart - Start DM campaign\n"
+        "/stop - Stop campaign\n"
+        "/status - Show current status\n"
+        "/test - Test if bot is working"
+    )
 
-@app.on_message(filters.command("addgroup") & filters.private)
-async def add_public_group(client, message):
-    print(f"🔍 [DEBUG] ADDGROUP command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/test', chats=lambda x: x.is_private))
+async def test_command(event):
+    await event.reply("✅ **Bot is working!** Test successful! 🎉")
+
+@bot.on(events.NewMessage(pattern='/connect', chats=lambda x: x.is_private))
+async def connect_session(event):
+    """Connect user's Telethon session"""
+    user_id = event.sender_id
+    
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /addgroup https://t.me/groupusername")
-            print(f"❌ [DEBUG] No link provided")
+            await event.reply(
+                "❌ **Usage:** /connect <session_string>\n\n"
+                "**How to get session string:**\n"
+                "```python\n"
+                "from telethon import TelegramClient\n"
+                "client = TelegramClient('session', api_id, api_hash)\n"
+                "await client.start()\n"
+                "print(client.session.save())\n"
+                "```\n"
+                "Copy the string and paste here."
+            )
+            return
+        
+        session_string = parts[1].strip()
+        
+        # Test session by creating client
+        await event.reply("⏳ Testing session... Please wait.")
+        
+        try:
+            # Create temporary client to test
+            test_client = TelegramClient(
+                f'test_{user_id}',
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session_string
+            )
+            await test_client.start()
+            me = await test_client.get_me()
+            await test_client.disconnect()
+            
+            # Save session
+            save_user_session(user_id, session_string, me.phone)
+            
+            # Store client
+            if user_id in user_clients:
+                await user_clients[user_id].disconnect()
+            user_clients[user_id] = TelegramClient(
+                f'user_{user_id}',
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session_string
+            )
+            
+            await event.reply(
+                f"✅ **Session connected!**\n\n"
+                f"📱 Phone: {me.phone}\n"
+                f"👤 Name: {me.first_name}\n"
+                f"🆔 ID: {me.id}\n\n"
+                f"Now you can add groups and start campaigns!"
+            )
+            
+        except Exception as e:
+            await event.reply(f"❌ **Invalid session!**\n\nError: {e}\n\nPlease check your session string.")
+            
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
+@bot.on(events.NewMessage(pattern='/disconnect', chats=lambda x: x.is_private))
+async def disconnect_session(event):
+    user_id = event.sender_id
+    
+    if user_id in user_clients:
+        try:
+            await user_clients[user_id].disconnect()
+        except:
+            pass
+        del user_clients[user_id]
+    
+    cursor.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    
+    await event.reply("✅ **Session disconnected!**")
+
+@bot.on(events.NewMessage(pattern='/session_status', chats=lambda x: x.is_private))
+async def session_status(event):
+    user_id = event.sender_id
+    session = get_user_session(user_id)
+    
+    if session:
+        await event.reply("✅ **Session is connected!**")
+    else:
+        await event.reply("❌ **No session connected!**\n\nUse /connect to connect your session.")
+
+@bot.on(events.NewMessage(pattern='/addgroup', chats=lambda x: x.is_private))
+async def add_public_group(event):
+    user_id = event.sender_id
+    
+    # Check if session exists
+    session = get_user_session(user_id)
+    if not session:
+        await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
+        return
+    
+    try:
+        parts = event.raw_text.split(" ", 1)
+        if len(parts) < 2:
+            await event.reply("❌ Usage: /addgroup https://t.me/groupusername")
             return
         
         link = parts[1].strip()
-        print(f"🔍 [DEBUG] Group link: {link}")
-        
-        # Extract username
         match = re.search(r'(?:https?://)?t\.me/([a-zA-Z0-9_]+)', link)
         if not match:
-            await message.reply_text("❌ Invalid group link!")
-            print(f"❌ [DEBUG] Invalid link format")
+            await event.reply("❌ Invalid group link!")
             return
         
         username = match.group(1)
-        print(f"🔍 [DEBUG] Username: {username}")
+        
+        # Get user client
+        if user_id not in user_clients:
+            user_clients[user_id] = TelegramClient(
+                f'user_{user_id}',
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session
+            )
         
         try:
-            print(f"🔍 [DEBUG] Getting chat info...")
-            chat = await client.get_chat(username)
-            print(f"✅ [DEBUG] Chat found: {chat.title}, ID: {chat.id}")
+            client = user_clients[user_id]
+            await client.connect()
             
-            add_group(chat.id, link, 0, chat.title or username)
+            # Get group info
+            entity = await client.get_entity(f"@{username}")
+            title = getattr(entity, 'title', username)
             
-            await message.reply_text(
+            add_group(user_id, entity.id, link, 0, title)
+            
+            await event.reply(
                 f"✅ **Group added!**\n"
-                f"📌 Title: {chat.title}\n"
-                f"🆔 ID: `{chat.id}`\n"
-                f"👥 Members: {chat.members_count or 'Unknown'}"
+                f"📌 Title: {title}\n"
+                f"🆔 ID: `{entity.id}`"
             )
-            print(f"✅ [DEBUG] Group added successfully!")
             
         except Exception as e:
-            print(f"❌ [DEBUG] Error getting chat: {e}")
-            await message.reply_text(f"❌ Error: {e}\n\nMake sure you're a member of this group.")
+            await event.reply(f"❌ Error: {e}\n\nMake sure you're a member of this group.")
             
     except Exception as e:
-        print(f"❌ [DEBUG] Error in addgroup: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("addprivate") & filters.private)
-async def add_private_group(client, message):
-    print(f"🔍 [DEBUG] ADDPRIVATE command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/addprivate', chats=lambda x: x.is_private))
+async def add_private_group(event):
+    user_id = event.sender_id
+    
+    # Check if session exists
+    session = get_user_session(user_id)
+    if not session:
+        await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
+        return
+    
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /addprivate -100123456789")
+            await event.reply("❌ Usage: /addprivate -100123456789")
             return
         
         chat_id = int(parts[1].strip())
-        print(f"🔍 [DEBUG] Chat ID: {chat_id}")
+        
+        if user_id not in user_clients:
+            user_clients[user_id] = TelegramClient(
+                f'user_{user_id}',
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session
+            )
         
         try:
-            chat = await client.get_chat(chat_id)
-            print(f"✅ [DEBUG] Chat found: {chat.title}")
+            client = user_clients[user_id]
+            await client.connect()
             
-            add_group(chat_id, f"private_{chat_id}", 1, chat.title or "Private Group")
+            entity = await client.get_entity(chat_id)
+            title = getattr(entity, 'title', "Private Group")
             
-            await message.reply_text(
+            add_group(user_id, chat_id, f"private_{chat_id}", 1, title)
+            
+            await event.reply(
                 f"✅ **Private group added!**\n"
-                f"📌 Title: {chat.title}\n"
+                f"📌 Title: {title}\n"
                 f"🆔 ID: `{chat_id}`"
             )
-            print(f"✅ [DEBUG] Private group added!")
             
         except Exception as e:
-            print(f"❌ [DEBUG] Error: {e}")
-            await message.reply_text(f"❌ Error: {e}\n\nMake sure you're a member of this group.")
+            await event.reply(f"❌ Error: {e}\n\nMake sure you're a member of this group.")
             
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("removegroup") & filters.private)
-async def remove_group_cmd(client, message):
-    print(f"🔍 [DEBUG] REMOVEGROUP command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/removegroup', chats=lambda x: x.is_private))
+async def remove_group_cmd(event):
+    user_id = event.sender_id
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /removegroup 123456789")
+            await event.reply("❌ Usage: /removegroup 123456789")
             return
         
         group_id = int(parts[1].strip())
-        print(f"🔍 [DEBUG] Removing group: {group_id}")
-        
-        remove_group(group_id)
-        await message.reply_text("✅ Group removed successfully!")
-        print(f"✅ [DEBUG] Group removed!")
+        remove_group(user_id, group_id)
+        await event.reply("✅ Group removed successfully!")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("listgroups") & filters.private)
-async def list_groups(client, message):
-    print(f"🔍 [DEBUG] LISTGROUPS command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/listgroups', chats=lambda x: x.is_private))
+async def list_groups(event):
+    user_id = event.sender_id
     try:
-        groups = get_all_groups()
+        groups = get_user_groups(user_id)
         
         if not groups:
-            await message.reply_text("❌ No groups added yet!")
-            print(f"🔍 [DEBUG] No groups found")
+            await event.reply("❌ No groups added yet!")
             return
         
         text = "📋 **Added Groups:**\n\n"
         for group in groups:
-            status = "🔒 Private" if group[3] else "🌐 Public"
-            text += f"• {group[4]} ({status})\n  ID: `{group[1]}`\n\n"
+            status = "🔒 Private" if group[4] else "🌐 Public"
+            text += f"• {group[5]} ({status})\n  ID: `{group[2]}`\n\n"
         
-        await message.reply_text(text)
-        print(f"✅ [DEBUG] Listed {len(groups)} groups")
+        await event.reply(text)
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("caption") & filters.private)
-async def set_caption(client, message):
-    print(f"🔍 [DEBUG] CAPTION command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/caption', chats=lambda x: x.is_private))
+async def set_caption(event):
+    user_id = event.sender_id
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /caption Your message here")
+            await event.reply("❌ Usage: /caption Your message here")
             return
         
         caption = parts[1].strip()
-        print(f"🔍 [DEBUG] Caption: {caption[:50]}...")
+        save_caption(user_id, caption)
         
-        save_caption(caption)
-        
-        await message.reply_text(
+        await event.reply(
             f"✅ **Caption set!**\n\n"
-            f"📝 {caption}\n\n"
+            f"📝 {caption[:200]}{'...' if len(caption) > 200 else ''}\n\n"
             f"Use /forcestart to begin sending."
         )
-        print(f"✅ [DEBUG] Caption saved!")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("setlimit") & filters.private)
-async def set_limit(client, message):
-    print(f"🔍 [DEBUG] SETLIMIT command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/setlimit', chats=lambda x: x.is_private))
+async def set_limit(event):
+    user_id = event.sender_id
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /setlimit 20")
+            await event.reply("❌ Usage: /setlimit 20")
             return
         
         limit = int(parts[1].strip())
-        print(f"🔍 [DEBUG] Limit: {limit}")
-        
         if limit < 1 or limit > 50:
-            await message.reply_text("❌ Limit must be between 1 and 50")
+            await event.reply("❌ Limit must be between 1 and 50")
             return
         
-        set_setting("member_limit", str(limit))
-        await message.reply_text(f"✅ Member limit set to: {limit}")
-        print(f"✅ [DEBUG] Limit set!")
+        set_setting(user_id, "member_limit", str(limit))
+        await event.reply(f"✅ Member limit set to: {limit}")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("setdelay") & filters.private)
-async def set_delay(client, message):
-    print(f"🔍 [DEBUG] SETDELAY command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/setdelay', chats=lambda x: x.is_private))
+async def set_delay(event):
+    user_id = event.sender_id
     try:
-        parts = message.text.split(" ", 1)
+        parts = event.raw_text.split(" ", 1)
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: /setdelay 3")
+            await event.reply("❌ Usage: /setdelay 3")
             return
         
         delay = int(parts[1].strip())
-        print(f"🔍 [DEBUG] Delay: {delay}")
-        
         if delay < 1 or delay > 10:
-            await message.reply_text("❌ Delay must be between 1 and 10 seconds")
+            await event.reply("❌ Delay must be between 1 and 10 seconds")
             return
         
-        set_setting("delay_seconds", str(delay))
-        await message.reply_text(f"✅ Delay set to: {delay} seconds")
-        print(f"✅ [DEBUG] Delay set!")
+        set_setting(user_id, "delay_seconds", str(delay))
+        await event.reply(f"✅ Delay set to: {delay} seconds")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("status") & filters.private)
-async def show_status(client, message):
-    print(f"🔍 [DEBUG] STATUS command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/status', chats=lambda x: x.is_private))
+async def show_status(event):
+    user_id = event.sender_id
     try:
-        groups = get_all_groups()
-        caption = get_caption()
-        limit = get_setting("member_limit") or "20"
-        delay = get_setting("delay_seconds") or "3"
-        running = get_setting("is_running") == "true"
-        
-        print(f"🔍 [DEBUG] Status: groups={len(groups)}, running={running}")
+        groups = get_user_groups(user_id)
+        caption = get_caption(user_id)
+        limit = get_setting(user_id, "member_limit") or "20"
+        delay = get_setting(user_id, "delay_seconds") or "3"
+        running = get_setting(user_id, "is_running") == "true"
+        session = get_user_session(user_id)
         
         status_text = f"""
 📊 **Bot Status**
 
+🔹 **Session:** {'🟢 Connected' if session else '🔴 Not connected'}
 🔹 **Groups:** {len(groups)}
 🔹 **Message:** {caption[:50] + '...' if caption and len(caption) > 50 else caption or 'Not set'}
 🔹 **Limit:** {limit} members/group
@@ -453,290 +557,252 @@ async def show_status(client, message):
 /forcestart - Start campaign
 /stop - Stop campaign
 """
-        await message.reply_text(status_text)
-        print(f"✅ [DEBUG] Status sent!")
+        await event.reply(status_text)
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("forcestart") & filters.private)
-async def force_start(client, message):
-    print(f"🔍 [DEBUG] FORCESTART command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/forcestart', chats=lambda x: x.is_private))
+async def force_start(event):
+    user_id = event.sender_id
+    
+    # Check session
+    session = get_user_session(user_id)
+    if not session:
+        await event.reply("❌ **Connect session first!**\n\nUse /connect <session_string>")
+        return
+    
     try:
         # Check if already running
-        if get_setting("is_running") == "true":
-            await message.reply_text("⚠️ Campaign already running! Use /stop first.")
-            print(f"⚠️ [DEBUG] Already running")
+        if get_setting(user_id, "is_running") == "true":
+            await event.reply("⚠️ Campaign already running! Use /stop first.")
             return
         
         # Check caption
-        caption = get_caption()
+        caption = get_caption(user_id)
         if not caption:
-            await message.reply_text("❌ Please set a caption first using /caption")
-            print(f"❌ [DEBUG] No caption set")
+            await event.reply("❌ Please set a caption first using /caption")
             return
         
         # Check groups
-        groups = get_all_groups()
+        groups = get_user_groups(user_id)
         if not groups:
-            await message.reply_text("❌ No groups added! Use /addgroup or /addprivate")
-            print(f"❌ [DEBUG] No groups added")
+            await event.reply("❌ No groups added! Use /addgroup or /addprivate")
             return
         
-        set_setting("is_running", "true")
-        print(f"✅ [DEBUG] Campaign started!")
+        set_setting(user_id, "is_running", "true")
         
-        await message.reply_text(
+        await event.reply(
             f"🚀 **Campaign started!**\n\n"
             f"📝 Message: {caption[:100]}{'...' if len(caption) > 100 else ''}\n"
             f"📊 Groups: {len(groups)}\n"
-            f"👥 Limit: {get_setting('member_limit')} members/group\n"
-            f"⏱️ Delay: {get_setting('delay_seconds')} seconds\n\n"
-            f"⏳ Sending messages... (Check /status for progress)"
+            f"👥 Limit: {get_setting(user_id, 'member_limit') or '20'} members/group\n"
+            f"⏱️ Delay: {get_setting(user_id, 'delay_seconds') or '3'} seconds\n\n"
+            f"⏳ Sending messages..."
         )
         
         # Start DM loop
-        print(f"🚀 [DEBUG] Starting DM loop...")
-        asyncio.create_task(dm_loop(client, message.chat.id))
+        asyncio.create_task(dm_loop(user_id, event.sender_id))
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
-@app.on_message(filters.command("stop") & filters.private)
-async def stop_campaign(client, message):
-    print(f"🔍 [DEBUG] STOP command received from {message.from_user.id}")
+@bot.on(events.NewMessage(pattern='/stop', chats=lambda x: x.is_private))
+async def stop_campaign(event):
+    user_id = event.sender_id
     try:
-        if get_setting("is_running") != "true":
-            await message.reply_text("⚠️ No campaign is currently running!")
-            print(f"⚠️ [DEBUG] Not running")
+        if get_setting(user_id, "is_running") != "true":
+            await event.reply("⚠️ No campaign is currently running!")
             return
         
-        set_setting("is_running", "false")
-        await message.reply_text("🛑 **Campaign stopped!**")
-        print(f"✅ [DEBUG] Campaign stopped!")
+        set_setting(user_id, "is_running", "false")
+        await event.reply("🛑 **Campaign stopped!**")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Error: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        await event.reply(f"❌ Error: {e}")
 
 # ============================================
-# TRACK ACTIVE USERS IN GROUPS
+# TRACK ACTIVE USERS
 # ============================================
 
-@app.on_message(filters.group)
-async def track_active(client, message):
+@bot.on(events.NewMessage(pattern='.*', chats=lambda x: x.is_group))
+async def track_active(event):
     try:
-        if message.from_user:
-            print(f"🔍 [DEBUG] Tracking active user: {message.from_user.id} in group {message.chat.id}")
-            track_active_user(message.from_user.id, message.chat.id)
+        if event.sender_id:
+            # Track for all users who have sessions
+            sessions = get_all_user_sessions()
+            for user_id, _ in sessions:
+                track_active_user(user_id, event.chat_id, event.sender_id)
     except Exception as e:
-        print(f"❌ [DEBUG] Error tracking user: {e}")
+        pass
 
 # ============================================
 # DM LOOP ENGINE
 # ============================================
 
-async def dm_loop(client, admin_chat_id):
-    print(f"🚀 [DEBUG] dm_loop started!")
+async def dm_loop(user_id, admin_chat_id):
+    print(f"🚀 DM Loop started for user {user_id}")
+    
+    # Get user client
+    session = get_user_session(user_id)
+    if not session:
+        return
+    
+    if user_id not in user_clients:
+        user_clients[user_id] = TelegramClient(
+            f'user_{user_id}',
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session
+        )
+    
     try:
-        groups = get_all_groups()
-        caption = get_caption()
-        member_limit = int(get_setting("member_limit") or 20)
-        delay = int(get_setting("delay_seconds") or 3)
+        client = user_clients[user_id]
+        await client.connect()
         
-        print(f"🔍 [DEBUG] Settings: groups={len(groups)}, limit={member_limit}, delay={delay}")
+        groups = get_user_groups(user_id)
+        caption = get_caption(user_id)
+        member_limit = int(get_setting(user_id, "member_limit") or 20)
+        delay = int(get_setting(user_id, "delay_seconds") or 3)
         
         total_sent = 0
         total_failed = 0
         
         for group in groups:
-            print(f"🔄 [DEBUG] Processing group: {group[4]}")
-            
-            # Check if stopped
-            if get_setting("is_running") != "true":
-                print(f"⏹️ [DEBUG] Campaign stopped by user")
+            if get_setting(user_id, "is_running") != "true":
+                print(f"⏹️ Campaign stopped for user {user_id}")
                 break
             
-            group_id = group[1]
-            group_title = group[4] or "Unknown"
+            group_id = group[2]
+            group_title = group[5] or "Unknown"
             
-            await client.send_message(
-                admin_chat_id,
-                f"🔄 Processing: {group_title}..."
-            )
-            print(f"✅ [DEBUG] Status update sent for {group_title}")
+            await bot.send_message(admin_chat_id, f"🔄 Processing: {group_title}...")
+            print(f"🔄 Processing {group_title}")
             
             try:
-                # Get active users (last 30 minutes)
-                active_users = get_active_users(group_id, minutes=30)
-                print(f"🔍 [DEBUG] Active users found: {len(active_users)}")
+                # Get active users
+                active_users = get_active_users(user_id, group_id, minutes=30)
+                print(f"🔍 Active users: {len(active_users)}")
                 
-                # If no active users, get recent members
                 if not active_users:
-                    await client.send_message(
+                    await bot.send_message(
                         admin_chat_id,
-                        f"⚠️ No active users found in {group_title}. Getting recent members..."
+                        f"⚠️ No active users found in {group_title}. Getting members..."
                     )
-                    print(f"⚠️ [DEBUG] No active users, getting recent members...")
                     
-                    recent_members = []
-                    async for member in client.get_chat_members(group_id, limit=member_limit):
-                        recent_members.append(member.user.id)
-                    
-                    users_to_dm = recent_members
-                    print(f"🔍 [DEBUG] Found {len(users_to_dm)} recent members")
+                    # Get members using user client
+                    try:
+                        entity = await client.get_entity(group_id)
+                        members = []
+                        async for participant in client.iter_participants(entity, limit=member_limit):
+                            if not participant.bot:
+                                members.append(participant.id)
+                        users_to_dm = members
+                        print(f"🔍 Found {len(users_to_dm)} members")
+                    except Exception as e:
+                        print(f"❌ Error getting members: {e}")
+                        await bot.send_message(
+                            admin_chat_id,
+                            f"⚠️ Could not get members for {group_title}"
+                        )
+                        continue
                 else:
                     users_to_dm = active_users[:member_limit]
-                    print(f"🔍 [DEBUG] Will DM {len(users_to_dm)} active users")
+                    print(f"🔍 Will DM {len(users_to_dm)} users")
                 
                 sent_count = 0
                 failed_count = 0
                 
-                for user_id in users_to_dm:
-                    print(f"🔄 [DEBUG] Processing user: {user_id}")
-                    
-                    # Check if stopped
-                    if get_setting("is_running") != "true":
-                        print(f"⏹️ [DEBUG] Campaign stopped during processing")
+                for target_user_id in users_to_dm:
+                    if get_setting(user_id, "is_running") != "true":
                         break
                     
-                    # Skip if already sent recently
-                    if is_already_sent(group_id, user_id):
-                        print(f"⏭️ [DEBUG] User {user_id} already sent, skipping")
+                    if is_already_sent(user_id, group_id, target_user_id):
+                        print(f"⏭️ Already sent to {target_user_id}")
                         continue
                     
-                    # Try to send message
                     try:
-                        print(f"📤 [DEBUG] Sending to {user_id}...")
-                        await client.send_message(user_id, caption)
-                        track_sent(group_id, user_id)
+                        print(f"📤 Sending to {target_user_id}")
+                        await client.send_message(target_user_id, caption)
+                        track_sent(user_id, group_id, target_user_id)
                         sent_count += 1
                         total_sent += 1
-                        print(f"✅ [DEBUG] Sent to {user_id} (Total: {total_sent})")
+                        print(f"✅ Sent to {target_user_id} (Total: {total_sent})")
                         
-                        # Progress update every 5 messages
                         if total_sent % 5 == 0:
-                            await client.send_message(
+                            await bot.send_message(
                                 admin_chat_id,
                                 f"📊 Progress: {total_sent} DMs sent so far..."
                             )
-                            print(f"📊 [DEBUG] Progress update sent: {total_sent}")
                             
-                    except FloodWait as e:
-                        print(f"⏳ [DEBUG] Flood wait: {e.x} seconds")
-                        await client.send_message(
+                    except FloodWaitError as e:
+                        print(f"⏳ Flood wait: {e.seconds}s")
+                        await bot.send_message(
                             admin_chat_id,
-                            f"⏳ Flood wait: {e.x} seconds. Pausing..."
+                            f"⏳ Flood wait: {e.seconds} seconds. Pausing..."
                         )
-                        await asyncio.sleep(e.x)
+                        await asyncio.sleep(e.seconds)
                         
-                    except PeerIdInvalid:
+                    except PeerIdInvalidError:
                         failed_count += 1
                         total_failed += 1
-                        print(f"❌ [DEBUG] PeerIdInvalid for {user_id}")
+                        print(f"❌ PeerIdInvalid for {target_user_id}")
                         
                     except Exception as e:
                         failed_count += 1
                         total_failed += 1
-                        print(f"❌ [DEBUG] Error sending to {user_id}: {e}")
+                        print(f"❌ Error: {e}")
                     
-                    # Delay between messages
-                    print(f"⏱️ [DEBUG] Waiting {delay} seconds...")
                     await asyncio.sleep(delay)
                 
-                await client.send_message(
+                await bot.send_message(
                     admin_chat_id,
-                    f"✅ {group_title}: Sent {sent_count} DMs, Failed {failed_count}"
+                    f"✅ {group_title}: Sent {sent_count}, Failed {failed_count}"
                 )
-                print(f"✅ [DEBUG] Group {group_title} completed: sent={sent_count}, failed={failed_count}")
-                
-                # Clear old sent logs to free space
-                clear_sent_log()
                 
             except Exception as e:
-                print(f"❌ [DEBUG] Error processing group {group_title}: {e}")
-                await client.send_message(
+                print(f"❌ Error in {group_title}: {e}")
+                await bot.send_message(
                     admin_chat_id,
                     f"❌ Error in {group_title}: {e}"
                 )
                 continue
         
-        # Campaign completed
-        set_setting("is_running", "false")
-        print(f"✅ [DEBUG] Campaign finished!")
-        
-        await client.send_message(
+        set_setting(user_id, "is_running", "false")
+        await bot.send_message(
             admin_chat_id,
             f"✅ **Campaign completed!**\n\n"
             f"📊 Total DMs sent: {total_sent}\n"
-            f"❌ Total failed: {total_failed}\n"
-            f"📋 Groups processed: {len(groups)}"
+            f"❌ Total failed: {total_failed}"
         )
-        print(f"✅ [DEBUG] Final summary sent!")
+        print(f"✅ Campaign completed for user {user_id}!")
         
     except Exception as e:
-        print(f"❌ [DEBUG] Fatal error in dm_loop: {e}")
-        set_setting("is_running", "false")
-        await client.send_message(admin_chat_id, f"❌ Campaign stopped due to error: {e}")
-
-# ============================================
-# TEST COMMAND
-# ============================================
-
-@app.on_message(filters.command("test") & filters.private)
-async def test_command(client, message):
-    print(f"🔍 [DEBUG] TEST command received from {message.from_user.id}")
-    try:
-        await message.reply_text("✅ **Bot is working!** Test successful!\n\nYour bot is running perfectly. 🎉")
-        print(f"✅ [DEBUG] Test reply sent!")
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in test: {e}")
-        await message.reply_text(f"❌ Error: {e}")
+        print(f"❌ Fatal error: {e}")
+        set_setting(user_id, "is_running", "false")
+        await bot.send_message(admin_chat_id, f"❌ Error: {e}")
 
 # ============================================
 # RUN BOT
 # ============================================
 
+async def main():
+    print("=" * 60)
+    print("🤖 Telethon DM Bot with /connect Session")
+    print("=" * 60)
+    print(f"🔍 Bot Token: {BOT_TOKEN[:15]}...")
+    print("=" * 60)
+    print("🚀 Bot is running! Send /connect to add your session")
+    print("=" * 60)
+    
+    await bot.run_until_disconnected()
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🤖 DM Bot Starting... (DEBUG MODE)")
-    print("=" * 60)
-    
-    print(f"🔍 [DEBUG] API ID: {API_ID}")
-    print(f"🔍 [DEBUG] API Hash: {API_HASH[:10]}...")
-    print(f"🔍 [DEBUG] Session String: {SESSION_STRING[:20]}...")
-    print(f"🔍 [DEBUG] Bot Token: {BOT_TOKEN[:15]}...")
-    print("=" * 60)
-    
-    # Check configuration
-    if API_ID == 32141443:
-        print("✅ [DEBUG] API ID found!")
-    else:
-        print("❌ [DEBUG] API ID looks wrong")
-    
-    if API_HASH != "4f34a89257ac316505f5a47b237454cc":
-        print("✅ [DEBUG] API Hash found!")
-    else:
-        print("❌ [DEBUG] API Hash looks wrong (default value)")
-    
-    if SESSION_STRING != "your_session_string_here":
-        print("✅ [DEBUG] Session String found!")
-    else:
-        print("❌ [DEBUG] Session String is default value! Please update!")
-    
-    print("=" * 60)
-    print(f"📊 Groups in database: {get_group_count()}")
-    print("=" * 60)
-    print("🚀 Starting bot... (Watch for errors below)")
-    print("=" * 60)
-    
     try:
-        app.run()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
     except Exception as e:
-        print(f"❌ [DEBUG] Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
-    
-    print("👋 Bot stopped!")
