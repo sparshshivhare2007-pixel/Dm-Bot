@@ -11,12 +11,12 @@ from pyrogram.errors import FloodWait, PeerIdInvalid
 # CONFIGURATION - Yahan apna data daalein
 # ============================================
 
-API_ID = 1234567  # Apna API ID daalein
-API_HASH = "your_api_hash_here"  # Apna API Hash daalein
-SESSION_STRING = "your_session_string_here"  # Apna Pyrogram Session String daalein
+API_ID = 32141443  # Apna API ID daalein
+API_HASH = "4f34a89257ac316505f5a47b237454cc"  # Apna API Hash daalein
+SESSION_STRING = "BQCZzqEAgaPva-BCCdfZXTFdBuFymHf78kAFzLGh_lxby6K4iIyXXtmItVIv8VxwyBIlZloGgMh-Rn-GKZifaJ4Ir2gEOuIWjjKQcZKQYLugYXhGfB9Pot0N8aFo7BKwla4sEb_Idues1Q7tXiJwP3yvJlo8W1dfTUSJPP3wdSRMNZs2_IdX8lTTM-2-sbdVRCqbzXM9NPkjw5bgQfw2SQvAVR4MzsP2YietQ47cQqPM8Wa_sYDGvUqPFcZSqSlbcd-EVuq4G_ot3HRX3Lh-8fETwyEvd74j9huZxx--jm508F0tnKVZ7V2og6Kcx1E79kijX9kQzrDTh9B74ZWqm3myOMOQPwAAAAF1XmqZAA"  # Apna Pyrogram Session String daalein
 
 # Bot Token (optional - agar bot commands chahiye toh)
-BOT_TOKEN = "your_bot_token_here"  # @BotFather se lo
+BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"  # @BotFather se lo
 
 # ============================================
 # DATABASE SETUP
