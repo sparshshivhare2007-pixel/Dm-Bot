@@ -31,7 +31,7 @@ print("=" * 60)
 
 API_ID = 32141443
 API_HASH = "4f34a89257ac316505f5a47b237454cc"
-BOT_TOKEN = "8640436717:AAHT6YYX2szV3Q3OUGR2_Wfa2QxAnunjFbE"
+BOT_TOKEN = "8004251874:AAHLs32lQukzgK0QtxLRQv1ACKahyBEPruA"
 
 # ============================================
 # DATABASE SETUP
